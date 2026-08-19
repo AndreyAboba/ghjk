@@ -114,6 +114,7 @@ local Config = {
 	PingSourceMaxRatio = 2.5,
 	PingWindow    = 24,
 	PingSampleGap = 0.03,
+	FallbackDodgeOnRefusal = true,
 
 	OverlapLeadBase = 2.0,
 	OverlapReaction = 0.050,
@@ -3855,6 +3856,14 @@ end
 
 local function fireBlock(tsServer)
 	if not Config.Enabled then return nil end
+	if State.blocking then
+		local c = localChar()
+		if c and c:GetAttribute("Blocking") == true then
+			State.blockedReason = nil
+			return tsServer
+		end
+		State.blocking, State.holdUntil = false, 0
+	end
 	local ok, reason = canBlockNow()
 	if not ok then
 		State.blockedReason = reason
