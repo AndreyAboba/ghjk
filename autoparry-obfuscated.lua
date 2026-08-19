@@ -5406,6 +5406,14 @@ local function performDodge(now, reason, preferBack, force, bypassAutoOff, dodge
 	State.lastDodgeInfo = {
 		fire=now, reason=reason, contactAbs=soonest, iframeLo=iframeLo, iframeHi=iframeHi,
 		dir=dirMode or (dir and "smart" or "input"), planned=planned,
+		-- ФИКС ЛОЖНОЙ ТЕЛЕМЕТРИИ: раньше DODGE-OUT в onOutcome привязывал
+		-- ЛЮБОЙ следующий исход того же attacker+kind в окне 0.9с к этому доджу
+		-- только по времени. В логе это дважды дало абсурд "fired 784/760ms
+		-- before → dodge TOO LATE": додж реально стрелял по одному свингу
+		-- (BlockCooldown → CD-DODGE), а событие резолва прилетало от СЛЕДУЮЩЕГО
+		-- свинга той же комбо-цепочки (combo+1) и присваивалось этому доджу.
+		-- Явно запоминаем цель — onOutcome сверяет rec.th с ней.
+		targetTh = timingTarget,
 	}
 	diagPush("DODGE  t=%.2f  %s%s  planned=%d  dir=%s  fire→contact=%s  iframe=[+%.0f,+%.0f]ms", now, reason, granted and " [GRANT]" or "", planned, State.lastDodgeInfo.dir,
 			soonest and string.format("%.0fms", (soonest-now)*1000) or "n/a",
@@ -5698,7 +5706,15 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 			   and (th.contactAbs - now) > -(Config.HoldAfter or 0.12) then
 				local latchOk = true
 				local latchWhy = nil
-					if Config.LatchStrict ~= false then
+				-- ══ ОБХОД СТРОГОГО ЛАТЧА ПРИ ПОДТВЕРЖДЁННОМ ХИТБОКСЕ ══
+				-- В диаге LATCH-DROP(NOT-AIMED-AT-ME) с face=-0.11..0.55 дважды дропал удар,
+				-- который через ~150-200мс подтверждался РЕАЛЬНЫМ оверлапом
+				-- хитбокса (EMERGENCY «хитбокс уже на нас») и заходил как чистый HIT.
+				-- halfW/halfD реконструированы из живых размеров и, по комментарию
+				-- выше по тексту, «врут»; а provenBy=="hitbox" (associatedHitbox) —
+				-- факт с сервера. Факту доверяем больше, чем своей геометрии.
+				local hbConfirmed = (th.provenBy == "hitbox") or (th.hbOverlapClock ~= nil)
+				if not hbConfirmed and Config.LatchStrict ~= false then
 						-- Тот же допуск, что и в основном тесте: латч не должен
 						-- оживлять удар, отклонённый по направлению (см. willHitMe).
 						local ang, allow = th.geomAngToMe, th.geomFaceAllow
@@ -6787,6 +6803,30 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 					wantBlock.lastReason = State.blockedReason
 					diagPush("BLOCK? t=%.2f  %s  %s  refused: %s", now, wantBlock.name, wantBlock.kind, State.blockedReason)
 				end
+				-- ══ ФОЛЛБЭК: БЛОК ОТКАЗАН → ПОСЛЕДНИЙ ШАНС ДОДЖЕМ ══════════════════
+				-- Диаг показал 4-5 из 7 реальных пропусков ровно тут: canBlockNow()
+				-- вернул false (BlockCooldown/CantAnything/Stunned), скрипт писал
+				-- "refused: %s" и на этом заканчивал — угроза уходила необработанной
+				-- (blockGap=NO-PRESS guard=NOT-BLOCKED). Существующий CD-DODGE выше
+				-- ловит только BlockCooldown/Unequip и только в узком тайминг-окне
+				-- ifLat..ifDur; EMERGENCY-нажатие (хитбокс уже на нас) идёт через тот
+				-- же fireBlock и фоллбэка вообще не имело. Додж не завязан на
+				-- Block.CooldownSeconds, поэтому пробуем его здесь как последний
+				-- рубеж — причина "must-dodge(...)" обходит центрирующее ожидание
+				-- в performDodge (optionalDodge=false), т.е. додж не будет молча
+				-- пропущен как "TOO LATE/слишком рано", а исполнится немедленно.
+				if not wantBlock.pressed and not wantBlock.coveredByDodge
+				   and Config.AutoDodge ~= false and Config.FallbackDodgeOnRefusal ~= false
+				   and dodgeReady() and canDodgeNow() and not counterPreemptsDodge(now) then
+					if performDodge(now, "must-dodge(block-refused:" .. tostring(State.blockedReason) .. ")",
+						false, true, false, wantBlock) then
+						wantBlock.coveredByDodge = true
+						diagPush("FALLBACK-DODGE t=%.2f %s %s contactIn=%.0fms → блок отказан (%s), додж как последний рубеж",
+							now, tostring(wantBlock.name), tostring(wantBlock.kind),
+							(wantBlock.contactAbs - now) * 1000, tostring(State.blockedReason))
+						return
+					end
+				end
 			end
 		end
 		local holdExtra = (wantBlock.kind == "M2" and Config.M2WidenWindow) and Config.M2WidenHold or 0
@@ -6936,7 +6976,14 @@ local function onOutcome(attacker, result, kind, eventClock)
 	if Config.DodgeTelemetry and State.lastDodgeInfo then
 		local di = State.lastDodgeInfo
 		local dtSinceFire = eventClock - di.fire
-		if dtSinceFire >= 0 and dtSinceFire <= 0.9 then
+		-- ФИКС ЛОЖНОЙ ПРИВЯЗКИ: раньше матчили ЛЮБОЙ исход того же attacker+kind
+		-- в окне 0.9с — без проверки, что это исход ТОГО ЖЕ свинга. Комбо бьёт
+		-- тем же attacker/kind каждые 300-450мс, поэтому додж по свингу c(N)
+		-- (например из-за BlockCooldown) молча получал в диагностику исход
+		-- свинга c(N+1) и давал абсурдные "fired 760-800ms before → TOO LATE".
+		-- Теперь: если у доджа была явная цель (targetTh), матчим ТОЛЬКО её.
+		local targetMatches = (di.targetTh == nil) or (rec.th ~= nil and rec.th == di.targetTh)
+		if targetMatches and dtSinceFire >= 0 and dtSinceFire <= 0.9 then
 			local hitT = eventClock
 			local rel
 			if hitT < di.iframeLo then
@@ -9430,4 +9477,3 @@ return function(_Lib, _Core)
 
 	return M
 end
-
