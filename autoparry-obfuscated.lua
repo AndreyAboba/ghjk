@@ -5335,7 +5335,8 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				tostring(a.coveredByHeldGuard), tostring(State.blocking))
 		end
 				if Config.ComboEscapeDodge and Config.DodgeOnParryCooldown ~= false
-				   and not canBlockNow() and coverable and not State.isAliBoxingM2(a)
+				   and not canBlockNow() and coverable and not aAlreadyDefended
+				   and not State.isAliBoxingM2(a)
 				   and not counterPreemptsDodge(now) then
 					if performDodge(now, "combo-escape") then return end
 				end
@@ -5343,7 +5344,8 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 			local busyRef = (Config.ExposedEscapeAttackOnly ~= false)
 				and (State.attackBusyUntil or 0) or (State.selfBusyUntil or 0)
 			if blatantOn and Config.ExposedEscapeDodge and busyRef > now
-			   and soonestDt <= Config.ExposedDodgeWindow and coverable and not State.isAliBoxingM2(a)
+			   and soonestDt <= Config.ExposedDodgeWindow and coverable and not aAlreadyDefended
+			   and not State.isAliBoxingM2(a)
 			   and not counterPreemptsDodge(now) then
 				if performDodge(now, "exposed-escape(blatant)", false, true) then return end
 			end
