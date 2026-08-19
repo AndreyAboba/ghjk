@@ -74,6 +74,7 @@ local Config = {
 	HoldAfter     = 0.12,
 	HoldLateGrace = 0.14,
 	GapOffsetCap  = 0.28,
+	LatchTrustMultiHit = true,
 
 	ServerGapOffsetMs = 0,
 	GapCalibDiag  = true,
@@ -3856,14 +3857,6 @@ end
 
 local function fireBlock(tsServer)
 	if not Config.Enabled then return nil end
-	if State.blocking then
-		local c = localChar()
-		if c and c:GetAttribute("Blocking") == true then
-			State.blockedReason = nil
-			return tsServer
-		end
-		State.blocking, State.holdUntil = false, 0
-	end
 	local ok, reason = canBlockNow()
 	if not ok then
 		State.blockedReason = reason
@@ -4751,6 +4744,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				local latchOk = true
 				local latchWhy = nil
 				local hbConfirmed = (th.provenBy == "hitbox") or (th.hbOverlapClock ~= nil)
+					or (th.group ~= nil and th.serverProven and Config.LatchTrustMultiHit ~= false)
 				if not hbConfirmed and Config.LatchStrict ~= false then
 						local ang, allow = th.geomAngToMe, th.geomFaceAllow
 						if ang and allow and ang > allow then
