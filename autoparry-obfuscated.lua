@@ -43,7 +43,8 @@ local Config = {
 	FaceHardDeg     = 100,
 	TurnSnapDeg     = 35,
 	StickyStrict    = true,
-	StickyReachPad  = 4.0,
+	StickyReachPad  = 6.0,
+	StickyFaceAllowPadDeg = 35,
 	LatchStrict     = true,
 	LatchSidePad    = 4.0,
 	MultiHitKeep    = true,
@@ -600,7 +601,7 @@ local logTrim = function(t, cap)
 	for i = n - drop + 1, n do t[i] = nil end
 end
 
-_D.DiagLog, _D.DIAG_MAX = {}, 1200
+_D.DiagLog, _D.DIAG_MAX = {}, 20000
 local diagPush = function(fmt, ...)
 	if not Config.DeepDiag then return end
 	local line = select("#", ...) > 0 and string.format(fmt, ...) or fmt
@@ -1433,7 +1434,8 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 				revive = d2 <= reachPad + (Config.StickyReachPad or 4.0)
 			elseif reason == "BACK-FACING" then
 				local ang, allow = th.geomAngToMe, th.geomFaceAllow
-				revive = (ang == nil) or (allow == nil) or (ang <= allow)
+				revive = (ang == nil) or (allow == nil)
+					or (ang <= allow + (Config.StickyFaceAllowPadDeg or 35))
 			end
 		end
 		if revive then
