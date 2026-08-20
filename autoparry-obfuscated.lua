@@ -17,7 +17,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "V176",
+	Version       = "V177",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -76,6 +76,8 @@ local Config = {
 	HoldLateGrace = 0.14,
 	GapOffsetCap  = 0.28,
 	LatchTrustMultiHit = true,
+	SchedulerWatchdog    = true,
+	LatchTrustThrottled  = true,
 
 	ServerGapOffsetMs = 0,
 	GapCalibDiag  = true,
@@ -713,6 +715,9 @@ local V93 = {
 	sortByContact = function(a, b) return a.contactAbs < b.contactAbs end,
 	dodgeParams = nil,
 	dodgeChar = nil,
+	lastWall = nil,
+	lastStepClock = 0,
+	schedulerSource = nil,
 }
 
 local function getPing()
@@ -1260,6 +1265,23 @@ local hitboxGeom = LPH_NO_VIRTUALIZE(function(th)
 	return center, forward, predA, flatLook
 end)
 
+local function attackerAnimThrottled(th)
+	if Config.LatchTrustThrottled == false then return false end
+	local model = th and th.attackerModel
+	if not model then return false end
+	if th.throttledFrame == _C.FrameId then return th.throttledNow == true end
+	th.throttledFrame = _C.FrameId
+	th.throttledNow = false
+	local ok, throttled = pcall(function()
+		local hum = model:FindFirstChildOfClass("Humanoid")
+			or model:FindFirstChildOfClass("AnimationController")
+		local animator = hum and hum:FindFirstChildOfClass("Animator")
+		return animator and animator.EvaluationThrottled == true
+	end)
+	th.throttledNow = ok and throttled == true
+	return th.throttledNow
+end
+
 local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 	if Config.PerfProbe then V93.probeWHM = (V93.probeWHM or 0) + 1 end
 	local myHRP, aHRP = localHRP(), th.attackerHRP
@@ -1414,6 +1436,10 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 		th.geomReachEff = reachEff
 		th.geomDist2d   = dist2d
 		hit = (dist2d <= reachEff) and faceOk
+		if not hit and th.serverProven and attackerAnimThrottled(th) then
+			hit = true
+			th.recognitionSource = "anim-throttled"
+		end
 	else
 		th.geomFaceToMe = nil
 		hit = depth >= (forward - halfD) and depth <= (forward + halfD) and side <= halfW
@@ -1430,7 +1456,9 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 			and "OUT-OF-REACH" or "BACK-FACING")) or "CURRENT-MISS"
 		local revive = true
 		if Config.StickyStrict ~= false and mode == "High" then
-			if reason == "OUT-OF-REACH" then
+			if attackerAnimThrottled(th) then
+				revive = true
+			elseif reason == "OUT-OF-REACH" then
 				revive = d2 <= reachPad + (Config.StickyReachPad or 4.0)
 			elseif reason == "BACK-FACING" then
 				local ang, allow = th.geomAngToMe, th.geomFaceAllow
@@ -4748,6 +4776,9 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				local hbConfirmed = (th.provenBy == "hitbox") or (th.hbOverlapClock ~= nil)
 					or (th.group ~= nil and th.serverProven and Config.LatchTrustMultiHit ~= false)
 				if not hbConfirmed and Config.LatchStrict ~= false then
+						local skipStrict = th.serverProven and (attackerAnimThrottled(th)
+							or ((th.contactAbs - now) <= (Config.ProvenReachWindow or 0.18)))
+						if not skipStrict then
 						local ang, allow = th.geomAngToMe, th.geomFaceAllow
 						if ang and allow and ang > allow then
 							latchOk, latchWhy = false, "NOT-AIMED-AT-ME"
@@ -4757,6 +4788,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 						and side > halfW + (Config.LatchSidePad or 4.0) then
 						latchOk, latchWhy = false, "OFF-AXIS"
 					end
+						end
 				end
 				if latchOk then
 					threatens = true
@@ -4827,10 +4859,9 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 						local gapBias = 0
 						local edgeS = (Config.GapEdgeMs or 6) / 1000
 						local pmin0 = Config.PerfectMin or 0.05
-							local up0 = uplink()
-							if type(up0) ~= "number" or up0 ~= up0 then up0 = 0.06 end
-							local gapOff0 = math.max(math.min(up0, Config.GapOffsetCap or 0.15), 0.02)
-						local vlCap = math.max(pwin - edgeS + gapOff0 - pmin0 - gapBias, 0)
+						-- lead/velLead are the intended remaining gap ON THE SERVER after
+						-- the activate packet arrives. pressAt already subtracts uplink.
+						local vlCap = math.max(pwin - edgeS - pmin0 - gapBias, 0)
 						if (th.velLead or 0) > vlCap then
 							if Config.DeepDiag and not th.vlClampLogged then
 								th.vlClampLogged = true
@@ -4840,7 +4871,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 							end
 							th.velLead = vlCap
 						end
-						local leadCap = math.max(pwin - edgeS + gapOff0 - (th.velLead or 0) - gapBias, pmin0)
+						local leadCap = math.max(pwin - edgeS - (th.velLead or 0) - gapBias, pmin0)
 					if lead > leadCap then
 						if Config.DeepDiag and not th.leadClampLogged then
 							th.leadClampLogged = true
@@ -4857,13 +4888,10 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 						local q = V93.frameDt or (1/60)
 						local qPeak = (V93.frameDtPeak or q) * (Config.LowFpsQuantPeakK or 0.75)
 						if qPeak > q then q = qPeak end
-							local upNow = uplink()
-							if type(upNow) ~= "number" or upNow ~= upNow then upNow = 0.06 end
-							local gapOff = math.max(math.min(upNow, Config.GapOffsetCap or 0.15), 0.02)
 							local center = pwin * 0.5
-							local target = center + gapOff + q * 0.5
-						local hiCap  = pwin - edge + gapOff
-						local loCap  = math.max(pmin, (Config.GapSafeFloorMs or 55) / 1000) + gapOff
+							local target = center + q * 0.5
+						local hiCap  = pwin - edge
+						local loCap  = math.max(pmin, (Config.GapSafeFloorMs or 55) / 1000)
 						if target > hiCap then target = hiCap end
 						if target < loCap then target = loCap end
 						local newLead = lead
@@ -4875,10 +4903,11 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 						if math.abs(newLead - lead) > 0.0005 then
 							if Config.DeepDiag and not th.jitLogged then
 								th.jitLogged = true
-								diagPush("LEAD-QUANT t=%.2f %s %s lead %.0f→%.0fms (кадр=%.0fms peak=%.0fms q=%.0fms velLead=%.0fms зазор станет [%.0f..%.0f]ms окно=[%.0f..%.0f]ms)",
+								diagPush("LEAD-QUANT t=%.2f %s %s lead %.0f→%.0fms (кадр=%.0fms peak=%.0fms q=%.0fms velLead=%.0fms serverGap=[%.0f..%.0f]ms localRemain=[%.0f..%.0f]ms окно=[%.0f..%.0f]ms)",
 									now, tostring(th.name), tostring(th.kind), lead*1000, newLead*1000,
 									(V93.frameDt or 0)*1000, (V93.frameDtPeak or 0)*1000, q*1000, vl*1000,
 									(newLead + vl + gapBias - q)*1000, (newLead + vl + gapBias)*1000,
+									(newLead + vl + gapBias + up - q)*1000, (newLead + vl + gapBias + up)*1000,
 									pmin*1000, pwin*1000)
 							end
 							lead = newLead
@@ -5537,7 +5566,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 					wantBlock.rec.pressDt = wantBlock.pressDt
 					wantBlock.rec.pressServer = serverNow
 					wantBlock.rec.pressClock = now
-					wantBlock.rec.pressAt = wantBlock.contactAbs - (Config.PerfectLead or 0) - up - (wantBlock.velLead or 0)
+					wantBlock.rec.pressAt = wantBlock.contactAbs - (wantBlock.aimGap or Config.PerfectLead or 0) - up
 					wantBlock.rec.pressLateBy = now - wantBlock.rec.pressAt
 					wantBlock.rec.faceDot = wantBlock.faceDot
 					local p1, ps = pingDiagSnapshot()
@@ -6940,9 +6969,22 @@ local restrictStep = LPH_NO_VIRTUALIZE(function(now)
 end)
 
 V93.schedulerPhase = RunService.PreSimulation and "PreSimulation" or "Heartbeat-fallback"
-;(RunService.PreSimulation or RunService.Heartbeat):Connect(LPH_NO_VIRTUALIZE(function(hbDt)
-	if type(hbDt) == "number" and hbDt > 0 then
-		local d = math.clamp(hbDt, 1/480, 0.25)
+local frameHandler = LPH_NO_VIRTUALIZE(function(hbDt, source)
+	local nowWall = os.clock()
+	if (nowWall - (V93.lastStepClock or 0)) < 0.00045 then
+		return
+	end
+	V93.lastStepClock = nowWall
+	V93.schedulerSource = source or V93.schedulerPhase
+	local wallDt = nowWall - (V93.lastWall or nowWall)
+	V93.lastWall = nowWall
+	local d
+	if wallDt > 1e-4 and wallDt < 0.5 then
+		d = math.clamp(wallDt, 1/480, 0.25)
+	elseif type(hbDt) == "number" and hbDt > 0 then
+		d = math.clamp(hbDt, 1/480, 0.25)
+	end
+	if d then
 		V93.frameDt = V93.frameDt + (d - V93.frameDt) * 0.2
 		if d > V93.frameDtPeak then
 			V93.frameDtPeak = d
@@ -6974,7 +7016,7 @@ V93.schedulerPhase = RunService.PreSimulation and "PreSimulation" or "Heartbeat-
 		State.status = "OFF"
 		return
 	end
-	local now = os.clock()
+	local now = nowWall
 	_C.FrameId = _C.FrameId + 1
 	local wantSteer = State.ap.steerUntil and now < State.ap.steerUntil and State.ap.steerDir
 	local wantDodgeSteer = State.ap.dodgeSteerUntil and now < State.ap.dodgeSteerUntil and State.ap.dodgeSteerDir
@@ -7000,9 +7042,10 @@ V93.schedulerPhase = RunService.PreSimulation and "PreSimulation" or "Heartbeat-
 		if elapsed >= 1 then
 			local inv = 1 / math.max(elapsed, 0.001)
 			aclog(string.format(
-				"[perf] threats(peak)=%d | schedulerStep avg=%.2fms peak=%.2fms | willHitMe=%.0f/s GetPartBoundsInBox=%.0f/s | fps~%.0f",
+				"[perf] threats(peak)=%d | schedulerStep avg=%.2fms peak=%.2fms | willHitMe=%.0f/s GetPartBoundsInBox=%.0f/s | fps~%.0f src=%s",
 				V93.probeThreatPeak or 0, (V93.stepCost or 0) * 1000, (V93.probeStepPeak or 0) * 1000,
-				(V93.probeWHM or 0) * inv, (V93.probeGPBB or 0) * inv, (V93.probeFrames or 0) * inv))
+				(V93.probeWHM or 0) * inv, (V93.probeGPBB or 0) * inv, (V93.probeFrames or 0) * inv,
+				tostring(V93.schedulerSource or "?")))
 			V93.probeLast = now
 			V93.probeWHM, V93.probeGPBB, V93.probeStepPeak, V93.probeThreatPeak, V93.probeFrames = 0, 0, 0, 0, 0
 		end
@@ -7025,7 +7068,19 @@ V93.schedulerPhase = RunService.PreSimulation and "PreSimulation" or "Heartbeat-
 	if not State.blocking and State.status ~= "THREAT" then
 		if now >= State.flashUntil then State.status = "ARMED" end
 	end
-end))
+end)
+;(RunService.PreSimulation or RunService.Heartbeat):Connect(function(hbDt)
+	frameHandler(hbDt, V93.schedulerPhase)
+end)
+if RunService.PreSimulation and Config.SchedulerWatchdog ~= false then
+	RunService.Heartbeat:Connect(function()
+		local now = os.clock()
+		local staleAfter = math.max((V93.frameDt or 1/60) * 1.85, 0.028)
+		if (now - (V93.lastStepClock or 0)) > staleAfter then
+			frameHandler(0, "Heartbeat-watchdog")
+		end
+	end)
+end
 
 local function summary()
 	local t = State.tally
@@ -7039,7 +7094,7 @@ local function summary()
 	return table.concat({
 		string.format("===== AUTOPARRY %s DIAG =====  (dumped %s UTC)", tostring(Config.Version or "?"), os.date("!%Y-%m-%d %H:%M:%S")),
 		string.format("player=%s  ping=%.0fms  uplink=%.0fms  mode=%s  autoface=%s", LocalPlayer.Name, getPingRaw()*1000, uplink()*1000, Config.Mode, tostring(Config.AutoFace)),
-		string.format("scheduler: phase=%s fps=%.1f frame=%.1fms peak=%.1fms lookahead=%.1fms step=%.1fms lowFps=%s", tostring(V93.schedulerPhase or "?"), 1 / math.max(V93.frameDt or 1/60, 1/480),
+		string.format("scheduler: phase=%s src=%s fps=%.1f frame=%.1fms peak=%.1fms lookahead=%.1fms step=%.1fms lowFps=%s", tostring(V93.schedulerPhase or "?"), tostring(V93.schedulerSource or "?"), 1 / math.max(V93.frameDt or 1/60, 1/480),
 				(V93.frameDt or 0)*1000, (V93.frameDtPeak or 0)*1000,
 				(V93.lookahead or 0)*1000, (V93.stepCost or 0)*1000,
 			V93.lowFps and "YES(aggressive)" or "no"),
