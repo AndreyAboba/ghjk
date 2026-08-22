@@ -17,7 +17,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "V181",
+	Version       = "V182",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -62,6 +62,7 @@ local Config = {
 	WillHitCloseCap = 12,
 	WillHitLatCap   = 1.5,
 	HighApproachCap = 14.0,
+	ApproachVelMin  = 0.5,
 	OvGapEps        = 1.25,
 
 	FeintFrac     = 0.80,
@@ -1360,7 +1361,6 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 	local hit
 	if mode == "High" then
 		local dist2d = math.sqrt(ox * ox + oz * oz)
-		local reach = forward + halfD + (Config.HighReachPad or 2.0)
 		local coreReach = forward + halfD
 		local toMeX, toMeZ = ox, oz
 		if dist2d > 0.05 then toMeX, toMeZ = ox / dist2d, oz / dist2d else toMeX, toMeZ = look.X, look.Z end
@@ -1368,6 +1368,7 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 		th.geomFaceToMe = faceToMe
 
 		local approachAllow = 0
+		local velMin = Config.ApproachVelMin or 0.5
 		do
 			local dtc = (th.contactAbs or now) - now
 			if dtc > 0 and dtc <= (Config.MaxWait or 1.2) then
@@ -1385,12 +1386,14 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 						local physVel = av.X * toMeX + av.Z * toMeZ
 						if physVel > velToMe then velToMe = physVel end
 					end
-				if velToMe > 0.5 then
+				if velToMe > velMin then
 					approachAllow = math.clamp(velToMe * dtc, 0, Config.HighApproachCap or 10.0)
 				end
 				th.closeVel = velToMe
 			end
 		end
+		local approaching = (th.closeVel or 0) > velMin
+		local reach = coreReach + (approaching and (Config.HighReachPad or 2.0) or 0)
 		th.geomApproach = approachAllow
 
 		do
@@ -1411,7 +1414,7 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 				end
 				if gapDepth > 0 then
 					local v = th.closeVel or 0
-					if v > 0.5 then dApp = gapDepth / v end
+					if v > (Config.ApproachVelMin or 0.5) then dApp = gapDepth / v end
 				end
 				d = math.max(dRot, dApp)
 				if d > life then d = life end
@@ -1456,7 +1459,8 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 		if th.serverProven then
 			local dtc = (th.contactAbs or now) - now
 			if dtc <= (Config.ProvenReachWindow or 0.18) then
-				reachEff = math.max(reachEff, coreReach + (Config.ProvenReachPad or 2.0))
+				local provenPad = approaching and (Config.ProvenReachPad or 2.0) or 0
+				reachEff = math.max(reachEff, coreReach + provenPad)
 			end
 		end
 		th.geomReachEff = reachEff
@@ -1483,7 +1487,8 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 		th.geomStickySource = th.recognitionSource or (mode == "High" and "predicted-overlap" or "current-overlap")
 	elseif not hit and th.serverProven and (th.geomStickyUntil or 0) >= now then
 		local d2       = math.sqrt(ox * ox + oz * oz)
-		local reachPad = forward + halfD + (Config.HighReachPad or 2.0)
+		local approaching = (th.closeVel or 0) > (Config.ApproachVelMin or 0.5)
+		local reachPad = forward + halfD + (approaching and (Config.HighReachPad or 2.0) or 0)
 		local reason = (mode == "High" and ((d2 > reachPad)
 			and "OUT-OF-REACH" or "BACK-FACING")) or "CURRENT-MISS"
 		local revive = true
@@ -1491,7 +1496,7 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 			if attackerAnimThrottled(th) then
 				revive = true
 			elseif reason == "OUT-OF-REACH" then
-				revive = d2 <= reachPad + (Config.StickyReachPad or 4.0)
+				revive = approaching and d2 <= reachPad + (Config.StickyReachPad or 4.0)
 			elseif reason == "BACK-FACING" then
 				local ang, allow = th.geomAngToMe, th.geomFaceAllow
 				revive = (ang == nil) or (allow == nil)
@@ -2619,7 +2624,10 @@ function State.updateCounterTxn(now)
 	if liveIFrames then
 		local follow = 0
 		for _, other in ipairs(Threats) do
-			if not other.feinted and not other.dodged then
+			local sameAttacker = (other == th)
+				or (th and other.attackerModel and th.attackerModel and other.attackerModel == th.attackerModel)
+				or (th and other.name == th.name)
+			if sameAttacker and not other.feinted and not other.dodged then
 				other.coveredByCounter = true
 				other.counterPendingId = nil
 				if other ~= th then follow = follow + 1 end
@@ -4146,7 +4154,7 @@ local function serverAttackProof(model)
 	return (ok and v) and true or false
 end
 
-local function reachLimit(kind)
+local function reachLimit(kind, approaching)
 	local sz = V93.sizes and V93.sizes[kind]
 	local half = 4.5
 	if sz then
@@ -4154,7 +4162,8 @@ local function reachLimit(kind)
 		if flat > 0 then half = flat / 2 end
 	end
 	local off = (kind == "M2") and 3 or 4
-	return off + half + 6 + (Config.ReachSlack or 1)
+	local pad = approaching and 6 or 0
+	return off + half + pad + (Config.ReachSlack or 1)
 end
 
 local function serverHitboxProof(ownerName)
@@ -4187,17 +4196,19 @@ local onAttack = function(attackerHRP, info, model, id, track)
 	end
 	local dist = (attackerHRP.Position - myHRP.Position).Magnitude
 	local kindGuess = (info and info.t) or "M1"
-	local reachMax = math.min(reachLimit(kindGuess), Config.Range)
+	local closingSpeed = 0
+	pcall(function()
+		local toMe = (myHRP.Position - attackerHRP.Position)
+		local flat = Vector3.new(toMe.X, 0, toMe.Z)
+		if flat.Magnitude > 0.1 then
+			local av = attackerHRP.AssemblyLinearVelocity
+			closingSpeed = Vector3.new(av.X, 0, av.Z):Dot(flat.Unit)
+		end
+	end)
+	local approaching = closingSpeed > (Config.ApproachVelMin or 0.5)
+	local reachMax = math.min(reachLimit(kindGuess, approaching), Config.Range)
 	if dist > reachMax then
-		local closingSpeed = 0
-		pcall(function()
-			local toMe = (myHRP.Position - attackerHRP.Position)
-			local flat = Vector3.new(toMe.X, 0, toMe.Z)
-			if flat.Magnitude > 0.1 then
-				local av = attackerHRP.AssemblyLinearVelocity
-				closingSpeed = Vector3.new(av.X, 0, av.Z):Dot(flat.Unit)
-			end
-		end)
+		if not approaching then return end
 		local canClose = math.max(closingSpeed, 0) * (Config.ReachCloseWindow or 0.35)
 		local closeCap = Config.ReachCloseCap or 8
 		if canClose > closeCap then canClose = closeCap end
@@ -5064,12 +5075,15 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 					local emergency = false
 					if Config.EmergencyPress ~= false and not th.pressed and th.hbOverlapClock
 					   and th.serverProven and now < th.hbOverlapClock + (Config.EmergencyPressGrace or 0.20) then
-						emergency = true
-						if Config.DeepDiag and not th.emergencyLogged then
-							th.emergencyLogged = true
-							diagPush("EMERGENCY t=%.2f %s %s хитбокс уже на нас (оверлап %+.0fms, прогноз contact %+.0fms) → жмём немедленно",
-								now, tostring(th.name), tostring(th.kind),
-								(now - th.hbOverlapClock) * 1000, (th.contactAbs - now) * 1000)
+						local remainEm = (th.contactAbs or now) - now
+						if remainEm <= (pwin + 0.04) then
+							emergency = true
+							if Config.DeepDiag and not th.emergencyLogged then
+								th.emergencyLogged = true
+								diagPush("EMERGENCY t=%.2f %s %s хитбокс уже на нас (оверлап %+.0fms, прогноз contact %+.0fms) → жмём немедленно",
+									now, tostring(th.name), tostring(th.kind),
+									(now - th.hbOverlapClock) * 1000, remainEm * 1000)
+							end
 						end
 					end
 					-- Выход из комбы: Activated в стане, если ParryBuffered=true.
@@ -5832,7 +5846,10 @@ local function onOutcome(attacker, result, kind, eventClock)
 			local r = q[i]
 			local age = eventClock - r.clock
 			if age >= 0 and age <= Config.MatchWindow and outcomeTypeMatches(r.type, kind) then
-				if not r.matched then
+				local pred = r.contact or 0
+				if pred > 0.15 and age < math.max(0.06, pred * 0.22) then
+					-- leftover Hit from a previous swing, not this rec
+				elseif not r.matched then
 					local score = math.abs((eventClock - r.clock) - (r.contact or 0))
 					if r.type == kind then
 						if not rec or score < (rec.matchScore or math.huge) then
