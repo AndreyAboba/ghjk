@@ -17,11 +17,11 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "V178",
+	Version       = "V179",
 	Enabled       = false,
 	Mode          = "Perfect",
 
-	Range         = 15,
+	Range         = 18,
 	ReachCloseCap = 8,
 	RequireFacing = false,
 	IncludeNPCs   = true,
@@ -32,26 +32,30 @@ local Config = {
 	HitboxDepth   = 4.0,
 	HitboxDepthBack = 1.0,
 	HitHalfWidth  = 3.0,
-	HitboxSlack   = 0.5,
-	HighSlack     = 0.35,
-	HighReachPad  = 3.0,
-	HighFaceFloor = -0.85,
-	ProvenReachPad    = 2.0,
-	ProvenReachWindow = 0.18,
+	HitboxSlack   = 1.25,
+	HighSlack     = 1.25,
+	HighReachPad  = 6.0,
+	HighFaceFloor = -0.50,
+	ProvenReachPad    = 4.0,
+	ProvenReachWindow = 0.22,
 	WillHitLeadFrac = 0.90,
 	FilterFailSafe= true,
-	FaceHardDeg     = 100,
-	TurnSnapDeg     = 35,
+	FaceHardDeg     = 115,
+	TurnSnapDeg     = 50,
 	StickyStrict    = true,
-	StickyReachPad  = 6.0,
-	StickyFaceAllowPadDeg = 35,
+	StickyReachPad  = 8.0,
+	StickyFaceAllowPadDeg = 45,
 	LatchStrict     = true,
-	LatchSidePad    = 4.0,
+	LatchSidePad    = 8.0,
 	MultiHitKeep    = true,
-	-- Boxing M2: разрыв контактов 0.45с < кулдауна блока 0.50с.
-	-- Оба перфекта не влезают; игра учит съесть первый и парировать второй.
-	MultiHitEatFirst = true,
-	HeavyFacePadDeg = 40,
+	-- Лог V178: eatFirst дал NO-PRESS на 1-й удар Boxing M2 (HIT), хотя
+	-- второй потом жался. Реагируем на первый, второй — додж (кулдаун 0.5с).
+	MultiHitEatFirst = false,
+	-- Метки Hit в анимации — TimePosition. Height-aMult на нашем клиенте
+	-- в track.Speed не виден (spd=1.00 при aMult=1.10). Делить маркеры на
+	-- aMult нельзя: контакт уезжал на ~50мс раньше, исход при TP=0.725.
+	MultiHitOverlapPad = 0.08,
+	HeavyFacePadDeg = 55,
 	GuardLastResort        = true,
 	GuardLastResortHorizon = 0.8,
 
@@ -60,6 +64,8 @@ local Config = {
 	WillHitVelCap   = 2.0,
 	WillHitCloseCap = 12,
 	WillHitLatCap   = 1.5,
+	HighApproachCap = 14.0,
+	OvGapEps        = 1.25,
 
 	FeintFrac     = 0.80,
 	FeintGraceMs  = 90,
@@ -1325,7 +1331,7 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 	local myAt = myPos
 	local halfW = (sz and sz.X * 0.5 or Config.HitHalfWidth or 3)
 		+ (mode == "High" and (Config.HighSlack or 0.35) or (Config.HitboxSlack or 0))
-	local halfH = (sz and sz.Y * 0.5 or 3) + 1.5
+	local halfH = (sz and sz.Y * 0.5 or 3) + 2.5
 	local halfD = sz and sz.Z * 0.5 or (Config.HitboxDepth or 4)
 	if math.abs(myAt.Y - origin.Y) > halfH then return false end
 	local ox, oz = myAt.X - origin.X, myAt.Z - origin.Z
@@ -3077,6 +3083,10 @@ end
 
 local function tryBoxingCounter(now)
 	wcPoll(now)
+	-- Лог V178: COUNTER-SEND через 21мс после TRACE-PRESS сорвал гард
+	-- (IN-WINDOW → LATE). Контра и парри в одном кадре несовместимы.
+	if State.blocking then return false end
+	if State.lastPress and (now - State.lastPress) < 0.28 then return false end
 	local best, bestDist = counterCandidate(now, true)
 	if not best then return false end
 	if wingChunCounterActive(best.attackerModel) then
@@ -4196,9 +4206,16 @@ local onAttack = function(attackerHRP, info, model, id, track)
 		local okT, tp = pcall(function() return track.TimePosition end)
 		if okT and type(tp) == "number" and tp > 0 then already = tp end
 	end
-	local aDiv  = (type(aMult) == "number" and aMult > 0.05) and aMult or 1
-	local hitTL = (info.contacts and info.contacts[1] and (info.contacts[1] / aDiv))
-		or hitTimeline(info, combo, aMult)
+	local hitTL
+	if info.contacts and info.contacts[1] then
+		-- Маркеры Hit — это TimePosition. На чужом клиенте Speed читается ~1,
+		-- даже если у атакующего height-mult. Деление на aMult в логе V178
+		-- дало contact=547ms при фактическом TP удара 0.725.
+		local pad = Config.MultiHitOverlapPad or 0
+		hitTL = info.contacts[1] + pad
+	else
+		hitTL = hitTimeline(info, combo, aMult)
+	end
 	local effSpd, spdSrc = effAnimSpeed(track, aMult, hitTL)
 	local hitTLReal  = hitTL
 	local remaining0 = math.max(0, hitTLReal - already / tpSpeed(track))
@@ -4276,7 +4293,8 @@ local onAttack = function(attackerHRP, info, model, id, track)
 		if Config.MultiHitEatFirst ~= false then
 			th.eatFirst = true
 		end
-		local hit2     = info.contacts[2] / aDiv
+		local pad    = Config.MultiHitOverlapPad or 0
+		local hit2     = info.contacts[2] + pad
 		local hit2Real = hit2
 		local rem2 = math.max(0, hit2Real - already / tpSpeed(track))
 		local th2 = table.clone(th)
@@ -5467,7 +5485,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 		end
 	end
 				if overloaded and counterPreemptsDodge(now) then overloaded = false end
-			if overloaded and not State.isAliBoxingM2(a) then
+			if overloaded and not aAlreadyDefended and not State.isAliBoxingM2(a) then
 				if performDodge(now, why) then return end
 			end
 			end
