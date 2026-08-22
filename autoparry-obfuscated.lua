@@ -17,7 +17,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "V177",
+	Version       = "V178",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -48,6 +48,10 @@ local Config = {
 	LatchStrict     = true,
 	LatchSidePad    = 4.0,
 	MultiHitKeep    = true,
+	-- Boxing M2: разрыв контактов 0.45с < кулдауна блока 0.50с.
+	-- Оба перфекта не влезают; игра учит съесть первый и парировать второй.
+	MultiHitEatFirst = true,
+	HeavyFacePadDeg = 40,
 	GuardLastResort        = true,
 	GuardLastResortHorizon = 0.8,
 
@@ -1436,6 +1440,12 @@ local willHitMe = LPH_NO_VIRTUALIZE(function(th)
 		th.geomReachEff = reachEff
 		th.geomDist2d   = dist2d
 		hit = (dist2d <= reachEff) and faceOk
+		if not hit and dist2d <= reachEff and (th.kind == "M2" or th.kind == "SKILL") then
+			local pad = math.rad(Config.HeavyFacePadDeg or 40)
+			if angToMe <= math.rad(Config.FaceHardDeg or 100) + pad then
+				hit, faceOk = true, true
+			end
+		end
 		if not hit and th.serverProven and attackerAnimThrottled(th) then
 			hit = true
 			th.recognitionSource = "anim-throttled"
@@ -1737,8 +1747,11 @@ local function comboFromName(nm)
 	return nil
 end
 local function kindFromName(nm)
+	if type(nm) ~= "string" or nm == "" then return nil end
 	if nm:match("M2") then return "M2" end
 	if nm:match("M1") then return "M1" end
+	local l = nm:lower()
+	if l:find("crit", 1, true) or l:find("momentum", 1, true) then return "M2" end
 	return nil
 end
 local function animIdOf(inst)
@@ -1799,10 +1812,17 @@ local function indexAllAnims()
 						end
 						if not _D.AttackIds[id] and not _D.BlockIds[id] then
 							local lname = d.Name:lower()
-							if not (lname:find("ehit") or lname:find("success"))
-								and (lname:find("crit") or lname:find("momentum")
-									or lname:find("slam") or lname:find("special") or lname:find("finisher")) then
-								_D.AttackIds[id] = { kind = "SKILL", combo = nil }
+							if not (lname:find("ehit") or lname:find("success")) then
+								local k = kindFromName(d.Name)
+								if not k and (lname:find("slam") or lname:find("special") or lname:find("finisher")) then
+									k = "SKILL"
+								end
+								if k then
+									_D.AttackIds[id] = {
+										kind = k, combo = nil, name = d.Name,
+										mom = lname:find("momentum") ~= nil,
+									}
+								end
 							end
 						end
 					end
@@ -1850,6 +1870,34 @@ local function isBoxingStyle(style)
 	return s:sub(1, 6) == "boxing"
 end
 
+local function styleM2MultiHitCount(style)
+	loadGameModules()
+	local cfg = GameData.cfg
+	if cfg and cfg.GetStyleNumber then
+		local ok, n = pcall(cfg.GetStyleNumber, style, "M2MultiHitCount", 1)
+		if ok and type(n) == "number" then return n end
+	end
+	if cfg then
+		local sl = string.lower(tostring(style or "")):gsub("[%s_%-]", "")
+		local alias = _D.STYLE_ALIAS
+		if type(alias) == "table" then sl = alias[sl] or sl end
+		local okS, styles = pcall(function() return cfg.Styles end)
+		local s = okS and type(styles) == "table" and (styles[style] or styles[sl]) or nil
+		if type(s) == "table" and type(s.M2MultiHitCount) == "number" then
+			return s.M2MultiHitCount
+		end
+	end
+	return isBoxingStyle(style) and 2 or 1
+end
+
+local function boxingM2ContactTable()
+	local mc = V93.boxingM2Contacts
+	if type(mc) == "table" and type(mc[1]) == "number" and type(mc[2]) == "number" then
+		return mc
+	end
+	return { 0.6000000, 1.0500000 }
+end
+
 local resolveInfo = function(id, model)
 	local entry  = _D.AttackIds[id]
 	if not entry then return nil end
@@ -1873,7 +1921,8 @@ local resolveInfo = function(id, model)
 		s     = style,
 		id    = id,
 		hit   = entry.hit,
-		contacts = (kind == "M2" and isBoxingStyle(style)) and V93.boxingM2Contacts or nil,
+		contacts = (kind == "M2" and styleM2MultiHitCount(style) >= 2)
+			and boxingM2ContactTable() or nil,
 		combo = entry and entry.combo or (legacy and legacy.c) or nil,
 		mom   = (entry and entry.mom) or (legacy and legacy.mom) or false,
 		name  = entry and entry.name or nil,
@@ -1884,6 +1933,7 @@ end
 _D.STYLE_ALIAS = {
 	hakariother = "hakario", hakarialt = "hakario", hakario = "hakario",
 	wing = "wingchun", wingchun = "wingchun", ["wing chun"] = "wingchun",
+	muay = "muaythai", ["muay thai"] = "muaythai", muaythai = "muaythai",
 }
 local function styleKey(s)
 	local sl = string.lower(tostring(s or "")):gsub("[%s_%-]", "")
@@ -4223,6 +4273,9 @@ local onAttack = function(attackerHRP, info, model, id, track)
 	if info.contacts and info.contacts[2] then
 		local group = { cancelled = false, held = false }
 		th.group, th.strike = group, 1
+		if Config.MultiHitEatFirst ~= false then
+			th.eatFirst = true
+		end
 		local hit2     = info.contacts[2] / aDiv
 		local hit2Real = hit2
 		local rem2 = math.max(0, hit2Real - already / tpSpeed(track))
@@ -4230,6 +4283,7 @@ local onAttack = function(attackerHRP, info, model, id, track)
 		th2.hitTL, th2.hitTLReal, th2.contact0, th2.contactAbs = hit2, hit2Real, rem2, nowClock + rem2
 		group.lastContact = th2.contactAbs
 		th2.strike, th2.pressed, th2.dodged = 2, false, false
+		th2.eatFirst = false
 		th2.pressDt, th2.faceDot, th2.rec = nil, nil, nil
 		th2.hitboxSeen, th2.hitboxSynced, th2.hitboxPart = nil, nil, nil
 		Threats[#Threats+1] = th2
@@ -4238,8 +4292,8 @@ local onAttack = function(attackerHRP, info, model, id, track)
 			speed = speed, matched = false, th = th2, strike = 2 }
 		th2.rec = rec2
 		q[#q+1] = rec2
-		diagPush("MULTI  t=%.2f  %s M2(Boxing) contacts=[%.0f,%.0f]ms markers=[%.0f,%.0f]ms speed=%.2f", nowClock, name, remaining0*1000, rem2*1000,
-				info.contacts[1]*1000, info.contacts[2]*1000, speed)
+		diagPush("MULTI  t=%.2f  %s M2 contacts=[%.0f,%.0f]ms markers=[%.0f,%.0f]ms eatFirst=%s speed=%.2f", nowClock, name, remaining0*1000, rem2*1000,
+				info.contacts[1]*1000, info.contacts[2]*1000, tostring(th.eatFirst == true), speed)
 	end
 	while #q > 10 do table.remove(q, 1) end
 
@@ -4740,6 +4794,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				or (Config.OmniBlock and State.blocking and th.enteredWindow
 					and th.contactAbs <= (State.holdUntil or 0) + 0.05)
 				if th.coveredByDodge or th.coveredByCounter then
+				elseif th.eatFirst then
 				elseif coveredByGuard then
 				State.guardCovered = (State.guardCovered or 0) + 1
 			elseif Config.DeepDiag and not th.pressed and not th.dodged and not th.deadLogged then
@@ -4828,10 +4883,11 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 			end
 			if threatens then th.everThreatened = true end
 			if threatens then
-				if th.group and th.group.held and State.blocking then
+				if th.group and th.group.held and State.blocking
+					and (th.strike or 1) < 2 and not th.eatFirst then
 					th.pressed, th.coveredByHeldGuard = true, true
 					State.holdUntil = math.max(State.holdUntil or 0,
-						(th.group.lastContact or th.contactAbs) + Config.HoldAfter + (Config.HoldLateGrace or 0))
+						th.contactAbs + Config.HoldAfter + (Config.HoldLateGrace or 0))
 				end
 				local ik = th.attackerModel or th.attackerHRP or th.name
 				if ik and not V93.interruptSeen[ik] then
@@ -4963,7 +5019,8 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				if (now >= pressAtQ and now <= holdEnd) or emergency then
 					th.enteredWindow = true
 					if Config.ServerProofGate and not th.serverProven
-					   and (th.suspect or (th.contactAbs - now) > (Config.ProofGraceSec or 0.06)) then
+					   and (th.suspect or ((th.kind ~= "M2" and th.kind ~= "SKILL")
+							and (th.contactAbs - now) > (Config.ProofGraceSec or 0.06))) then
 						if not th.baitHeldLogged then
 							th.baitHeldLogged = true
 							th.proofHoldClock = now
@@ -5001,7 +5058,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 								end
 							end
 						end
-						if take then wantBlock = th end
+						if take and not th.eatFirst then wantBlock = th end
 					end
 				end
 					if dt <= (Config.FaceLeadWindow + up) and dt >= -Config.HoldAfter
@@ -5079,7 +5136,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 			local anchor = cluster[i]
 			if anchor and not anchor.planCovered then
 				local forceDodge = isMustDodge(anchor)
-				local canParry = (not forceDodge)
+				local canParry = (not forceDodge) and (not anchor.eatFirst)
 					and (anchor.contactAbs - lead - up) >= (blockFreeAt - actGap)
 				if canParry then
 					plannedParries = plannedParries + 1
@@ -5130,6 +5187,8 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 			clusterStrategy = "PARRY_THEN_DODGE"
 		elseif plannedParries >= 2 then
 			clusterStrategy = "SEQUENTIAL"
+		elseif plannedParries >= 1 then
+			clusterStrategy = "PARRY"
 		elseif plannedDodges >= 1 and plannedParries == 0 then
 			clusterStrategy = "IFRAME_CLUSTER"
 		end
@@ -5466,6 +5525,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 	end
 
 	if wantBlock and State.interruptFiredFrame == _C.FrameId then wantBlock = nil end
+	if wantBlock and wantBlock.eatFirst then wantBlock = nil end
 
 		local heldPwin = (Config.PerfectWindowLive ~= false and GameData.perfectWindow)
 			or Config.PerfectWindow or 0.125
@@ -5754,9 +5814,13 @@ local function onOutcome(attacker, result, kind, eventClock)
 		if not (State.multiThreat and holding) then State.blocking, State.holdUntil = false, 0 end
 	end
 	if result == "PERFECT" and rec.th and rec.th.group then
-		rec.th.group.cancelled = true
+		if (rec.th.strike or 1) >= 2 then
+			rec.th.group.cancelled = true
+		end
 	elseif result == "EARLY" and rec.th and rec.th.group then
-		rec.th.group.held = true
+		if (rec.th.strike or 1) >= 2 then
+			rec.th.group.held = true
+		end
 	end
 	if result == "PERFECT" and rec.th and rec.th.clusterStrategy == "HELD_GUARD" then
 		for _, other in ipairs(Threats) do
@@ -5877,7 +5941,20 @@ local function hookAnimator(animator)
 		if not Config.Enabled then return end
 		if not rec.enemy then return end
 		if _D.BlockIds[id] then return end
-		if not attackEntry(id) then return end
+		if not attackEntry(id) then
+			local nm = anim.Name
+			local k = kindFromName(nm)
+			if not k then
+				local p = anim.Parent
+				if p then k = kindFromName(p.Name) end
+			end
+			if not k then return end
+			_D.AttackIds[id] = {
+				kind = k, combo = (k == "M1") and comboFromName(nm) or nil,
+				name = nm, mom = tostring(nm):lower():find("momentum") ~= nil,
+			}
+		end
+		local knownKind = attackEntry(id) and attackEntry(id).kind
 		if Config.AntiDecoy and Config.DecoyHardDrop ~= false then
 			local S = State.decoySeen; if not S then S = {}; State.decoySeen = S end
 			local nowd = os.clock()
@@ -5897,7 +5974,8 @@ local function hookAnimator(animator)
 			end
 			local dk = tostring(rec.model and rec.model.Name or "?") .. "|" .. tostring(id)
 			local prevT = S[dk]
-			if prevT and (nowd - prevT) < (Config.DecoyRefireSec or 0.60) then
+			if knownKind ~= "M2" and knownKind ~= "SKILL"
+				and prevT and (nowd - prevT) < (Config.DecoyRefireSec or 0.60) then
 				State.decoyDropped = (State.decoyDropped or 0) + 1
 				if (nowd - (State.lastDecoyLog or 0)) > 1 then
 					State.lastDecoyLog = nowd
@@ -7560,6 +7638,19 @@ RunService.RenderStepped:Connect(function()
 end)
 
 indexAllAnims()
+task.spawn(function()
+	local anims = ReplicatedStorage:WaitForChild("Animations", 90)
+	local combat = anims and anims:WaitForChild("Combat", 90)
+	if not combat then return end
+	indexAllAnims()
+	if _C.animWatch then return end
+	_C.animWatch = true
+	combat.DescendantAdded:Connect(function(d)
+		if d.ClassName == "Animation" or d.ClassName == "Folder" then
+			indexAllAnims()
+		end
+	end)
+end)
 loadGameModules()
 scanAnimators()
 Players.PlayerAdded:Connect(function(plr)
