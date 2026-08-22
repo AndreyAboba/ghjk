@@ -17,7 +17,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "V180",
+	Version       = "V181",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -806,11 +806,14 @@ local function canBlockNow()
 		return false, "Unequip"
 	end
 	-- Игра шлёт Activated в стане, если ParryBuffered=true (Block_ModuleScript).
-	-- Локальный прогноз кулдауна по lastPress это ломал: после HIT/LATE
-	-- буфер есть, серверный BlockCooldown уже снят, а мы отказывали.
+	-- Локальный прогноз кулдауна обходим только пока реально в стане с буфером.
+	-- Сам атрибут ParryBuffered живёт 2с после хита — если обходить CD всегда,
+	-- каждый следующий свинг жмётся слишком рано (лог V180: +310ms).
 	-- Атрибут BlockCooldown по-прежнему гейтит — как клиент игры.
+	local stunned = c:GetAttribute("Stunned") == true
+	local cantAny = c:GetAttribute("CantAnything") == true
 	local buffered = parryBufferedNow(c)
-	if Config.BlockCooldownPredict ~= false and not buffered then
+	if Config.BlockCooldownPredict ~= false and not (buffered and (stunned or cantAny)) then
 		local rel = State.lastBlockRelease or State.lastPress
 		if rel then
 			local cd = Config.BlockCooldown or 0.5
@@ -821,8 +824,6 @@ local function canBlockNow()
 	for _, attr in ipairs(_D.HARD_BLOCKERS) do
 		if c:GetAttribute(attr) == true then return false, attr end
 	end
-	local stunned = c:GetAttribute("Stunned") == true
-	local cantAny = c:GetAttribute("CantAnything") == true
 	if stunned or cantAny then
 		if c:GetAttribute("ParryWindowDisabled") ~= true
 		   and c:GetAttribute("PerfectBlocking") ~= true
@@ -2616,12 +2617,35 @@ function State.updateCounterTxn(now)
 	end
 
 	if liveIFrames then
+		local follow = 0
+		for _, other in ipairs(Threats) do
+			if not other.feinted and not other.dodged then
+				other.coveredByCounter = true
+				other.counterPendingId = nil
+				if other ~= th then follow = follow + 1 end
+			end
+		end
 		if th then
 			th.coveredByCounter, th.counterPendingId, th.resolved = true, nil, true
 		end
-		tx.confirmed, tx.pending, tx.result = false, false, "IFRAMES"
+		if not tx.confirmed then
+			tx.confirmed, tx.pending, tx.result = true, false, "IFRAMES"
+			State.counterIFramesUntil = now + 0.45
+			diagPush("COUNTER-CONFIRM t=%.2f id=%s src=IFRAMES sentAgo=%.0fms → threat covered, dodge not needed", now, tostring(tx.threatId), (now - tx.sent) * 1000)
+		elseif follow > 0 and not tx.followCoverLogged then
+			tx.followCoverLogged = true
+			diagPush("COUNTER-COVER t=%.2f id=%s follow-ups=%d while IFRAMES live → не парируем (CantAnything от своего M2)", now, tostring(tx.threatId), follow)
+		end
+		return
+	end
+	if tx.confirmed then
+		for _, other in ipairs(Threats) do
+			if other.coveredByCounter and other ~= th and not other.resolved then
+				other.coveredByCounter = nil
+			end
+		end
+		tx.confirmed, tx.pending, tx.followCoverLogged = false, false, nil
 		State.counterIFramesUntil = 0
-		diagPush("COUNTER-CONFIRM t=%.2f id=%s src=IFRAMES sentAgo=%.0fms → threat covered, dodge not needed", now, tostring(tx.threatId), (now - tx.sent) * 1000)
 		return
 	end
 
@@ -4925,7 +4949,8 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 					V93.interruptSeen[ik] = true
 					State.interruptThreatCount = State.interruptThreatCount + 1
 				end
-				if (th.kind == "M1" or th.kind == "M2") and (not State.interruptCandidate
+				if (th.kind == "M1" or th.kind == "M2") and not th.coveredByCounter
+				   and (not State.interruptCandidate
 				   or th.contactAbs < State.interruptCandidate.contactAbs) then
 					State.interruptCandidate = th
 				end
@@ -5047,21 +5072,30 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 								(now - th.hbOverlapClock) * 1000, (th.contactAbs - now) * 1000)
 						end
 					end
-					-- Выход из комбы: игра принимает Activated в Stunned/CantAnything,
-					-- как только ParryBuffered=true (окно ParryBufferAfterHit=2с).
-					-- Не ждём pressAt — буфер появляется после HIT, окно перфекта уже узкое.
-					if not emergency and not th.pressed and th.serverProven and parryBufferedNow() then
-						local remain = th.contactAbs - now
-						if remain <= (pwin + hold + up) and remain >= -(hold + 0.05) then
-							emergency = true
-							if Config.DeepDiag and not th.bufferEscapeLogged then
-								th.bufferEscapeLogged = true
-								diagPush("BUFFER-PARRY t=%.2f %s %s contactIn=%+.0fms → ParryBuffered, жмём из стана",
-									now, tostring(th.name), tostring(th.kind), remain * 1000)
+					-- Выход из комбы: Activated в стане, если ParryBuffered=true.
+					-- Жмём досрочно ТОЛЬКО когда окно перфекта уже наступило
+					-- (или контакт ближе лида). Иначе буфер на 2с после хита
+					-- превращает каждый детект в pressDt=+310ms → EARLY/LATE.
+					if not emergency and not th.pressed and th.serverProven
+					   and not th.coveredByCounter then
+						local me = localChar()
+						local inStun = me and (me:GetAttribute("Stunned") == true
+							or me:GetAttribute("CantAnything") == true)
+						if inStun and parryBufferedNow(me) then
+							local remain = th.contactAbs - now
+							local due = (now >= pressAtQ)
+								or remain <= (lead + up + (th.velLead or 0) + 0.03)
+							if due and remain <= (pwin + 0.02) and remain >= -(hold + 0.05) then
+								emergency = true
+								if Config.DeepDiag and not th.bufferEscapeLogged then
+									th.bufferEscapeLogged = true
+									diagPush("BUFFER-PARRY t=%.2f %s %s contactIn=%+.0fms → буфер в стане, окно уже открыто",
+										now, tostring(th.name), tostring(th.kind), remain * 1000)
+								end
 							end
 						end
 					end
-				if (now >= pressAtQ and now <= holdEnd) or emergency then
+				if ((now >= pressAtQ and now <= holdEnd) or emergency) and not th.coveredByCounter then
 					th.enteredWindow = true
 					if Config.ServerProofGate and not th.serverProven
 					   and (th.suspect or ((th.kind ~= "M2" and th.kind ~= "SKILL")
@@ -5123,7 +5157,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 					or (th.geomLatched and not th.trustedHit
 						and (now - (th.geomLatchSince or now)) > (Config.LatchClusterGrace or 0.25))
 				if dt <= Config.DodgeHorizon and dt >= -Config.HoldAfter and not th.staleTrack
-					and not reachPhantom then
+					and not reachPhantom and not th.coveredByCounter then
 					imminent[#imminent+1] = th
 				end
 			end
