@@ -17,7 +17,7 @@ local _C = {}
 local _D = {}
 
 local Config = {
-	Version       = "V179",
+	Version       = "V180",
 	Enabled       = false,
 	Mode          = "Perfect",
 
@@ -48,9 +48,6 @@ local Config = {
 	LatchStrict     = true,
 	LatchSidePad    = 8.0,
 	MultiHitKeep    = true,
-	-- Лог V178: eatFirst дал NO-PRESS на 1-й удар Boxing M2 (HIT), хотя
-	-- второй потом жался. Реагируем на первый, второй — додж (кулдаун 0.5с).
-	MultiHitEatFirst = false,
 	-- Метки Hit в анимации — TimePosition. Height-aMult на нашем клиенте
 	-- в track.Speed не виден (spd=1.00 при aMult=1.10). Делить маркеры на
 	-- aMult нельзя: контакт уезжал на ~50мс раньше, исход при TP=0.725.
@@ -295,6 +292,9 @@ local Config = {
 	AP_M2BaseReach       = 6.5,
 	AP_M2Gap             = 0.30,
 	AP_M2IFrameMargin    = 0.035,
+	-- I-frames M2 обычно стартуют у первого хитбокса, не с кадра Activate.
+	-- Не прерываем удар, который прилетит раньше нашего окна неуязвимости.
+	AP_M2IFrameLead      = 0.10,
 	AP_AnimGuard    = true,
 	AP_AnimFallback = 0.45,
 	AP_MaxPerSec      = 8,
@@ -789,13 +789,28 @@ end
 
 _D.HARD_BLOCKERS = { "BlockCooldown", "Ragdoll", "Downed", "Greenzone",
                         "RpCombatLocked", "StaffModPeaceMode" }
+local function parryBufferedNow(c)
+	if Config.ComboEscape == false then return false end
+	c = c or localChar()
+	if not c then return false end
+	return c:GetAttribute("ParryBuffered") == true
+		and c:GetAttribute("ParryWindowDisabled") ~= true
+		and c:GetAttribute("GuardBroken") ~= true
+		and c:GetAttribute("PerfectBlocking") ~= true
+end
+
 local function canBlockNow()
 	local c = localChar()
 	if not c then return false, "no-char" end
 	if Config.RequireEquip ~= false and c:GetAttribute("Equip") ~= true then
 		return false, "Unequip"
 	end
-	if Config.BlockCooldownPredict ~= false then
+	-- Игра шлёт Activated в стане, если ParryBuffered=true (Block_ModuleScript).
+	-- Локальный прогноз кулдауна по lastPress это ломал: после HIT/LATE
+	-- буфер есть, серверный BlockCooldown уже снят, а мы отказывали.
+	-- Атрибут BlockCooldown по-прежнему гейтит — как клиент игры.
+	local buffered = parryBufferedNow(c)
+	if Config.BlockCooldownPredict ~= false and not buffered then
 		local rel = State.lastBlockRelease or State.lastPress
 		if rel then
 			local cd = Config.BlockCooldown or 0.5
@@ -3724,6 +3739,9 @@ function State.ap.tryInterrupt(now, th, threatCount)
 		if secondClose then return false end
 	end
 	if not ap.interruptible(th) or not ap.canAttack(true) then return false end
+	-- Парирование важнее interrupt: M2 ставит CantAnything и следующий удар
+	-- комбы проходит, пока мы ещё в замахе (лог V179: INTERRUPT → refused).
+	if select(1, canBlockNow()) then return false end
 	local enemyLeft = (th.contactAbs or now) - now
 	if enemyLeft < 0.05 then return false end
 	local baseMargin = th.kind == "M2" and (Config.AP_InterruptMargin or 0.055) * 0.6
@@ -3744,7 +3762,8 @@ function State.ap.tryInterrupt(now, th, threatCount)
 		if d then
 			m2Iframes = ap.m2GrantsIFrames()
 			if m2Iframes then
-				if netLag + (Config.AP_M2IFrameMargin or 0.035) < enemyLeft then
+				local iframeStart = math.max(0, d - (Config.AP_M2IFrameLead or 0.10))
+				if enemyLeft >= iframeStart + netLag + (Config.AP_M2IFrameMargin or 0.035) then
 					m2Hit, m2Var = d + netLag, variant
 				end
 			elseif d + netLag + baseMargin < enemyLeft then
@@ -3776,7 +3795,6 @@ function State.ap.tryInterrupt(now, th, threatCount)
 		tag = string.format("M1/c%d", m1Combo or 0)
 	end
 	th.interruptAttempted = true
-	th.pressed = true
 	State.interruptFiredFrame = _C.FrameId
 	State.status = useM2 and "INTERRUPT-M2" or "INTERRUPT"
 	diagPush("INTERRUPT t=%.2f %s %s(%s) via=%s ours=%.0fms enemy=%.0fms margin=%.0fms m1=%s m2=%s guard=fallback", now, th.name or "?", th.kind or "?", th.style or "?", tag,
@@ -4290,9 +4308,6 @@ local onAttack = function(attackerHRP, info, model, id, track)
 	if info.contacts and info.contacts[2] then
 		local group = { cancelled = false, held = false }
 		th.group, th.strike = group, 1
-		if Config.MultiHitEatFirst ~= false then
-			th.eatFirst = true
-		end
 		local pad    = Config.MultiHitOverlapPad or 0
 		local hit2     = info.contacts[2] + pad
 		local hit2Real = hit2
@@ -4301,7 +4316,6 @@ local onAttack = function(attackerHRP, info, model, id, track)
 		th2.hitTL, th2.hitTLReal, th2.contact0, th2.contactAbs = hit2, hit2Real, rem2, nowClock + rem2
 		group.lastContact = th2.contactAbs
 		th2.strike, th2.pressed, th2.dodged = 2, false, false
-		th2.eatFirst = false
 		th2.pressDt, th2.faceDot, th2.rec = nil, nil, nil
 		th2.hitboxSeen, th2.hitboxSynced, th2.hitboxPart = nil, nil, nil
 		Threats[#Threats+1] = th2
@@ -4310,8 +4324,8 @@ local onAttack = function(attackerHRP, info, model, id, track)
 			speed = speed, matched = false, th = th2, strike = 2 }
 		th2.rec = rec2
 		q[#q+1] = rec2
-		diagPush("MULTI  t=%.2f  %s M2 contacts=[%.0f,%.0f]ms markers=[%.0f,%.0f]ms eatFirst=%s speed=%.2f", nowClock, name, remaining0*1000, rem2*1000,
-				info.contacts[1]*1000, info.contacts[2]*1000, tostring(th.eatFirst == true), speed)
+		diagPush("MULTI  t=%.2f  %s M2 contacts=[%.0f,%.0f]ms markers=[%.0f,%.0f]ms speed=%.2f", nowClock, name, remaining0*1000, rem2*1000,
+				info.contacts[1]*1000, info.contacts[2]*1000, speed)
 	end
 	while #q > 10 do table.remove(q, 1) end
 
@@ -4812,7 +4826,6 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 				or (Config.OmniBlock and State.blocking and th.enteredWindow
 					and th.contactAbs <= (State.holdUntil or 0) + 0.05)
 				if th.coveredByDodge or th.coveredByCounter then
-				elseif th.eatFirst then
 				elseif coveredByGuard then
 				State.guardCovered = (State.guardCovered or 0) + 1
 			elseif Config.DeepDiag and not th.pressed and not th.dodged and not th.deadLogged then
@@ -4902,7 +4915,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 			if threatens then th.everThreatened = true end
 			if threatens then
 				if th.group and th.group.held and State.blocking
-					and (th.strike or 1) < 2 and not th.eatFirst then
+					and (th.strike or 1) < 2 then
 					th.pressed, th.coveredByHeldGuard = true, true
 					State.holdUntil = math.max(State.holdUntil or 0,
 						th.contactAbs + Config.HoldAfter + (Config.HoldLateGrace or 0))
@@ -5034,6 +5047,20 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 								(now - th.hbOverlapClock) * 1000, (th.contactAbs - now) * 1000)
 						end
 					end
+					-- Выход из комбы: игра принимает Activated в Stunned/CantAnything,
+					-- как только ParryBuffered=true (окно ParryBufferAfterHit=2с).
+					-- Не ждём pressAt — буфер появляется после HIT, окно перфекта уже узкое.
+					if not emergency and not th.pressed and th.serverProven and parryBufferedNow() then
+						local remain = th.contactAbs - now
+						if remain <= (pwin + hold + up) and remain >= -(hold + 0.05) then
+							emergency = true
+							if Config.DeepDiag and not th.bufferEscapeLogged then
+								th.bufferEscapeLogged = true
+								diagPush("BUFFER-PARRY t=%.2f %s %s contactIn=%+.0fms → ParryBuffered, жмём из стана",
+									now, tostring(th.name), tostring(th.kind), remain * 1000)
+							end
+						end
+					end
 				if (now >= pressAtQ and now <= holdEnd) or emergency then
 					th.enteredWindow = true
 					if Config.ServerProofGate and not th.serverProven
@@ -5076,7 +5103,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 								end
 							end
 						end
-						if take and not th.eatFirst then wantBlock = th end
+						if take then wantBlock = th end
 					end
 				end
 					if dt <= (Config.FaceLeadWindow + up) and dt >= -Config.HoldAfter
@@ -5154,7 +5181,7 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 			local anchor = cluster[i]
 			if anchor and not anchor.planCovered then
 				local forceDodge = isMustDodge(anchor)
-				local canParry = (not forceDodge) and (not anchor.eatFirst)
+				local canParry = (not forceDodge)
 					and (anchor.contactAbs - lead - up) >= (blockFreeAt - actGap)
 				if canParry then
 					plannedParries = plannedParries + 1
@@ -5543,7 +5570,6 @@ local schedulerStep = LPH_NO_VIRTUALIZE(function(now)
 	end
 
 	if wantBlock and State.interruptFiredFrame == _C.FrameId then wantBlock = nil end
-	if wantBlock and wantBlock.eatFirst then wantBlock = nil end
 
 		local heldPwin = (Config.PerfectWindowLive ~= false and GameData.perfectWindow)
 			or Config.PerfectWindow or 0.125
